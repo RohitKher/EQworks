@@ -13,7 +13,7 @@ DAG_ID = MODULE_NAME
 #  docker-compose YAML file for Airflow. This task will make use of the
 #  same PostgreSQL server and the same database/schema that Airflow uses.
 #  Note: the Airflow version can be found in the description for this task.
-DB_HOST = 'localhost'
+DB_HOST = 'postgres'
 DB_PORT = '8080'
 DB_USERNAME = 'airflow'
 DB_PASSWORD = 'airflow'
