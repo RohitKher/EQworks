@@ -1,10 +1,16 @@
 import os
 import random
 from typing import List
+import datetime
+import logging
+
+logger = logging.getLogger('airflow.task')
 
 import sqlalchemy
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+
 
 MODULE_NAME = os.path.splitext(os.path.basename(__file__))[0]
 DAG_ID = MODULE_NAME
@@ -13,8 +19,8 @@ DAG_ID = MODULE_NAME
 #  docker-compose YAML file for Airflow. This task will make use of the
 #  same PostgreSQL server and the same database/schema that Airflow uses.
 #  Note: the Airflow version can be found in the description for this task.
-DB_HOST = 'postgres'
-DB_PORT = '8080'
+DB_HOST = 'ws-data-pipeline_postgres_1'
+DB_PORT = '5432'
 DB_USERNAME = 'airflow'
 DB_PASSWORD = 'airflow'
 DB_DATABASE = 'airflow'
@@ -87,37 +93,26 @@ def is_raise_error() -> bool:
 def create_tables(**kwargs) -> None:
     """Create table 'dummy_job' and table 'dummy_job_result' if they do not
     exist.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_CREATE_TABLES].
-
     The query for the table creation can be found in variable
     [QUERY_JOB_TABLE_CREATION] and variable [QUERY_JOB_RESULT_TABLE_CREATION].
-
     The tables can be created either by executing the provided raw query,
     or by using ORM (based on the information in the provided query).
     """
 
-    # TODO: your code here
-    engine = create_engine(DB_URI)
-    conn = engine.connect()
-
-    sql_text = text("CREATE TABLE IF NOT EXISTS {JOB_TABLE_NAME} (
-        id SERIAL PRIMARY KEY,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE
-    );")
-    with engine.connect() as conn:
-    result = conn.execute(sql_text)
-    for row in result:
-        print(row)
-
+    with get_engine().begin() as con:    
+        con.execute(
+            QUERY_JOB_TABLE_CREATION + 
+            QUERY_JOB_RESULT_TABLE_CREATION
+            )
+ 
+     
 def insert_recs(**kwargs) -> None:
     """Insert a new record into table 'dummy_job' and table
     'dummy_job_result' respectively.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_INSERT_RECS].
-
     Actions:
         - insert a record into table [JOB_TABLE_NAME]. The DB will
             automatically generate an integer for column 'id'. We regard
@@ -130,7 +125,29 @@ def insert_recs(**kwargs) -> None:
         - add other thing you think necessary.
     """
 
-    # TODO: your code here
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    WITH ins_job_table as (
+        INSERT INTO {JOB_TABLE_NAME} 
+        DEFAULT VALUES 
+        RETURNING id
+    )
+    INSERT INTO {JOB_RESULT_TABLE_NAME} (job_id) 
+    SELECT
+        id
+    FROM
+        ins_job_table
+    RETURNING job_id
+    ;  
+    """
+
+    with get_engine().begin() as con:    
+        res = con.execute(UPDATE_JOB_AND_RESULT_TABLES)
+        id = res.fetchall()[0][0]        
+
+    if 'ti' in kwargs:
+        kwargs['ti'].xcom_push(key='id', value=id) 
+    else:
+        raise KeyError('"ti" key is not available in kwargs!')
 
 
 def get_hit_count(
@@ -142,10 +159,8 @@ def get_hit_count(
     Args:
         num_str: a string that contains ASCII characters.
         rand_digit_amount: total amount of random digits to generate.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_GET_HIT_COUNT].
-
     Actions:
       - randomly generate a random digit (from 0 to 9) and tell whether
         it can be found in string [num_str].
@@ -155,20 +170,30 @@ def get_hit_count(
           in the same run.
       - add other thing you think necessary.
     """
+
     # Simulate a scenario that this task fails for unknown reasons
     if is_raise_error():
-        raise ValueError
-
-    # TODO: your code here
-
-
+        logger.error('test the logger :-))')
+        raise ValueError('random error to test the pipeline')
+    
+    cnts = {}    
+    for i in range(rand_digit_amount):
+        rand_digit_str = str(get_rand_digit())        
+        if rand_digit_str in cnts:
+            cnts[rand_digit_str] += 1
+        else:
+            if rand_digit_str in num_str:
+                cnts[rand_digit_str] = 1
+     
+    cnt = sum(cnts.values())
+    kwargs['ti'].xcom_push(key='cnt', value=cnt)  
+    
+ 
 def branching(**kwargs) -> List[str]:
     """Returns the list of task IDs for the next tasks.
-
     This function will be run in a DAG task with task ID [TASK_ID_BRANCHING].
     That DAG task is based on 'BranchPythonOperator'. Please refer to the
     official documentation for 'BranchPythonOperator'.
-
     Actions:
         - Get the hit count in task [TASK_ID_GET_HIT_COUNT].
         - If the hit count in [TASK_ID_GET_HIT_COUNT] is greater than
@@ -179,16 +204,19 @@ def branching(**kwargs) -> List[str]:
         - add other thing you think necessary.
     """
 
-    # TODO: your code here
+    hit_count = kwargs['ti'].xcom_pull(key='cnt')
+    
+    if hit_count > HIT_COUNT_THRESHOLD:
+        return TASK_ID_ACTION_ON_GT_THRESHOLD
+    else:
+        return TASK_ID_ACTION_ON_LTE_THRESHOLD
 
 
 def action_on_gt_threshold(**kwargs) -> None:
     """Actions to be taken when the hit count is greater than the given
     threshold.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_ACTION_ON_GT_THRESHOLD].
-
     Actions:
         - Get the job ID generated in task [TASK_ID_INSERT_RECS].
         - Update the record created in task [TASK_ID_INSERT_RECS] in table
@@ -200,17 +228,29 @@ def action_on_gt_threshold(**kwargs) -> None:
             - set column 'is_gt_th' to be 'true'
         - add other thing you think necessary.
     """
+  
+    id = kwargs['ti'].xcom_pull(key='id')
 
-    # TODO: your code here
+    UPDATE_JOB_AND_RESULT_TABLES = f"""    
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = TRUE, 
+    is_gt_th = TRUE 
+    WHERE job_id = {id}
+    ;
+    """
+    with get_engine().begin() as con:    
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)   
 
 
 def action_on_lte_threshold(**kwargs) -> None:
     """Actions to be taken when the hit count is less than or equal to the
     given threshold.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_ACTION_ON_LTE_THRESHOLD].
-
     Actions:
         - Get the job ID generated in task [TASK_ID_INSERT_RECS].
         - Update the record created in task [TASK_ID_INSERT_RECS] in table
@@ -223,15 +263,27 @@ def action_on_lte_threshold(**kwargs) -> None:
         - add other thing you think necessary.
     """
 
-    # TODO: your code here
+    id = kwargs['ti'].xcom_pull(key='id')
 
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = TRUE, 
+    is_gt_th = FALSE 
+    WHERE job_id = {id}
+    ;    
+    """
+    with get_engine().begin() as con:
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)
+ 
 
 def action_on_error(**kwargs) -> None:
     """Actions to be taken when an exception is raised.
-
     This function will be run in a DAG task with task ID
     [TASK_ID_ACTION_ON_ERROR].
-
     Actions:
         - Get the job ID generated in task [TASK_ID_INSERT_RECS].
         - Update the record created in task [TASK_ID_INSERT_RECS] in table
@@ -244,7 +296,20 @@ def action_on_error(**kwargs) -> None:
         - add other thing you think necessary.
     """
 
-    # TODO: your code here
+    id = kwargs['ti'].xcom_pull(key='id')
+    
+    UPDATE_JOB_AND_RESULT_TABLES = f"""
+    UPDATE {JOB_TABLE_NAME} 
+    SET is_active = FALSE 
+    WHERE id={id}
+    ;
+    UPDATE {JOB_RESULT_TABLE_NAME} 
+    SET is_successful = FALSE 
+    WHERE job_id = {id}
+    ;
+    """    
+    with get_engine().begin() as con:  
+        con.execute(UPDATE_JOB_AND_RESULT_TABLES)
 
 
 # DAG creation ##########################################
@@ -252,14 +317,15 @@ def action_on_error(**kwargs) -> None:
 
 default_args = {
     'owner': DAG_ID[4:],
-    'end_date': '2100-01-01',
-    # TODO: add other arguments to make the pipeline runs as expected
+    'end_date': '2100-01-01'  
 }
 
 dag_kwargs = {
     "dag_id": DAG_ID,
     "default_args": default_args,
-    # TODO: add other arguments to make the pipeline runs as expected
+    "start_date": datetime.datetime(2022, 1, 1),
+    "schedule_interval": datetime.timedelta(minutes=1),
+    "catchup":False
 }
 
 with DAG(**dag_kwargs) as dag:
@@ -279,6 +345,7 @@ with DAG(**dag_kwargs) as dag:
     task_branching = BranchPythonOperator(
         task_id=TASK_ID_BRANCHING,
         python_callable=branching,
+        provide_context=True
     )
     task_action_on_lte_threshold = PythonOperator(
         task_id=TASK_ID_ACTION_ON_LTE_THRESHOLD,
@@ -290,10 +357,10 @@ with DAG(**dag_kwargs) as dag:
     )
     task_action_on_error = PythonOperator(
         task_id=TASK_ID_ACTION_ON_ERROR,
-        python_callable=action_on_error,
-        # TODO: add argument(s) such that this task runs only when its previous
-        #  task fails
+        python_callable=action_on_error,        
+        trigger_rule='one_failed'
     )
-
-    # TODO: define the dependencies between DAG tasks.
-    #   Your code here.
+    
+    task_create_tables >> task_insert_recs >> task_get_hit_count >> task_branching 
+    task_branching >> [task_action_on_lte_threshold, task_action_on_gt_threshold]
+    task_get_hit_count >> task_action_on_error
